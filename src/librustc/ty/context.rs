@@ -55,36 +55,37 @@ use rustc_data_structures::stable_hasher::{HashStable, hash_stable_hashmap,
 use arena::{TypedArena, DroplessArena};
 use rustc_const_math::{ConstInt, ConstUsize};
 use rustc_data_structures::indexed_vec::IndexVec;
+use rustc_data_structures::sync::{Sync, Lrc, Lock};
 use std::any::Any;
 use std::borrow::Borrow;
-use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::hash_map::{self, Entry};
 use std::hash::{Hash, Hasher};
 use std::mem;
 use std::ops::Deref;
 use std::iter;
-use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::Mutex;
 use syntax::abi;
 use syntax::ast::{self, Name, NodeId};
 use syntax::attr;
 use syntax::codemap::MultiSpan;
 use syntax::symbol::{Symbol, keywords};
 use syntax_pos::Span;
+use util::common::ThreadLocal;
 
 use hir;
 
 pub struct AllArenas<'tcx> {
-    pub global: GlobalArenas<'tcx>,
+    pub global: ThreadLocal<GlobalArenas<'tcx>>,
     pub interner: DroplessArena,
 }
 
 impl<'tcx> AllArenas<'tcx> {
     pub fn new() -> Self {
         AllArenas {
-            global: GlobalArenas::new(),
+            global: ThreadLocal::new(|| GlobalArenas::new()),
             interner: DroplessArena::new(),
         }
     }
@@ -127,26 +128,26 @@ pub struct CtxtInterners<'tcx> {
 
     /// Specifically use a speedy hash algorithm for these hash sets,
     /// they're accessed quite often.
-    type_: RefCell<FxHashSet<Interned<'tcx, TyS<'tcx>>>>,
-    type_list: RefCell<FxHashSet<Interned<'tcx, Slice<Ty<'tcx>>>>>,
-    substs: RefCell<FxHashSet<Interned<'tcx, Substs<'tcx>>>>,
-    region: RefCell<FxHashSet<Interned<'tcx, RegionKind>>>,
-    existential_predicates: RefCell<FxHashSet<Interned<'tcx, Slice<ExistentialPredicate<'tcx>>>>>,
-    predicates: RefCell<FxHashSet<Interned<'tcx, Slice<Predicate<'tcx>>>>>,
-    const_: RefCell<FxHashSet<Interned<'tcx, Const<'tcx>>>>,
+    type_: Lock<FxHashSet<Interned<'tcx, TyS<'tcx>>>>,
+    type_list: Lock<FxHashSet<Interned<'tcx, Slice<Ty<'tcx>>>>>,
+    substs: Lock<FxHashSet<Interned<'tcx, Substs<'tcx>>>>,
+    region: Lock<FxHashSet<Interned<'tcx, RegionKind>>>,
+    existential_predicates: Lock<FxHashSet<Interned<'tcx, Slice<ExistentialPredicate<'tcx>>>>>,
+    predicates: Lock<FxHashSet<Interned<'tcx, Slice<Predicate<'tcx>>>>>,
+    const_: Lock<FxHashSet<Interned<'tcx, Const<'tcx>>>>,
 }
 
 impl<'gcx: 'tcx, 'tcx> CtxtInterners<'tcx> {
     fn new(arena: &'tcx DroplessArena) -> CtxtInterners<'tcx> {
         CtxtInterners {
-            arena,
-            type_: RefCell::new(FxHashSet()),
-            type_list: RefCell::new(FxHashSet()),
-            substs: RefCell::new(FxHashSet()),
-            region: RefCell::new(FxHashSet()),
-            existential_predicates: RefCell::new(FxHashSet()),
-            predicates: RefCell::new(FxHashSet()),
-            const_: RefCell::new(FxHashSet()),
+            arena: arena,
+            type_: Lock::new(FxHashSet()),
+            type_list: Lock::new(FxHashSet()),
+            substs: Lock::new(FxHashSet()),
+            region: Lock::new(FxHashSet()),
+            existential_predicates: Lock::new(FxHashSet()),
+            predicates: Lock::new(FxHashSet()),
+            const_: Lock::new(FxHashSet()),
         }
     }
 
@@ -157,12 +158,12 @@ impl<'gcx: 'tcx, 'tcx> CtxtInterners<'tcx> {
                  -> Ty<'tcx> {
         let ty = {
             let mut interner = self.type_.borrow_mut();
-            let global_interner = global_interners.map(|interners| {
-                interners.type_.borrow_mut()
-            });
             if let Some(&Interned(ty)) = interner.get(&st) {
                 return ty;
             }
+            let global_interner = global_interners.map(|interners| {
+                interners.type_.borrow_mut()
+            });
             if let Some(ref interner) = global_interner {
                 if let Some(&Interned(ty)) = interner.get(&st) {
                     return ty;
@@ -397,9 +398,9 @@ pub struct TypeckTables<'tcx> {
 
     /// Set of trait imports actually used in the method resolution.
     /// This is used for warning unused imports. During type
-    /// checking, this `Rc` should not be cloned: it must have a ref-count
+    /// checking, this `Lrc` should not be cloned: it must have a ref-count
     /// of 1 so that we can insert things into the set mutably.
-    pub used_trait_imports: Rc<DefIdSet>,
+    pub used_trait_imports: Lrc<DefIdSet>,
 
     /// If any errors occurred while type-checking this body,
     /// this field will be set to `true`.
@@ -426,7 +427,7 @@ impl<'tcx> TypeckTables<'tcx> {
             liberated_fn_sigs: ItemLocalMap(),
             fru_field_types: ItemLocalMap(),
             cast_kinds: ItemLocalMap(),
-            used_trait_imports: Rc::new(DefIdSet()),
+            used_trait_imports: Lrc::new(DefIdSet()),
             tainted_by_errors: false,
             free_region_map: FreeRegionMap::new(),
         }
@@ -785,7 +786,7 @@ impl<'tcx> CommonTypes<'tcx> {
 #[derive(Copy, Clone)]
 pub struct TyCtxt<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     gcx: &'a GlobalCtxt<'gcx>,
-    interners: &'a CtxtInterners<'tcx>
+    interners: &'a CtxtInterners<'tcx>,
 }
 
 impl<'a, 'gcx, 'tcx> Deref for TyCtxt<'a, 'gcx, 'tcx> {
@@ -796,10 +797,10 @@ impl<'a, 'gcx, 'tcx> Deref for TyCtxt<'a, 'gcx, 'tcx> {
 }
 
 pub struct GlobalCtxt<'tcx> {
-    global_arenas: &'tcx GlobalArenas<'tcx>,
+    global_arenas: &'tcx ThreadLocal<GlobalArenas<'tcx>>,
     global_interners: CtxtInterners<'tcx>,
 
-    cstore: &'tcx CrateStore,
+    cstore: &'tcx (CrateStore + Sync),
 
     pub sess: &'tcx Session,
 
@@ -816,11 +817,11 @@ pub struct GlobalCtxt<'tcx> {
     /// Map indicating what traits are in scope for places where this
     /// is relevant; generated by resolve.
     trait_map: FxHashMap<DefIndex,
-                         Rc<FxHashMap<ItemLocalId,
-                                      Rc<StableVec<TraitCandidate>>>>>,
+                         Lrc<FxHashMap<ItemLocalId,
+                                       Lrc<StableVec<TraitCandidate>>>>>,
 
     /// Export map produced by name resolution.
-    export_map: FxHashMap<DefId, Rc<Vec<Export>>>,
+    export_map: FxHashMap<DefId, Lrc<Vec<Export>>>,
 
     pub hir: hir_map::Map<'tcx>,
 
@@ -833,14 +834,14 @@ pub struct GlobalCtxt<'tcx> {
     // Records the free variables refrenced by every closure
     // expression. Do not track deps for this, just recompute it from
     // scratch every time.
-    freevars: FxHashMap<DefId, Rc<Vec<hir::Freevar>>>,
+    freevars: FxHashMap<DefId, Lrc<Vec<hir::Freevar>>>,
 
     maybe_unused_trait_imports: FxHashSet<DefId>,
 
     maybe_unused_extern_crates: Vec<(DefId, Span)>,
 
     // Internal cache for metadata decoding. No need to track deps on this.
-    pub rcache: RefCell<FxHashMap<ty::CReaderCacheKey, Ty<'tcx>>>,
+    pub rcache: Lock<FxHashMap<ty::CReaderCacheKey, Ty<'tcx>>>,
 
     /// Caches the results of trait selection. This cache is used
     /// for things that do not have to do with the parameters in scope.
@@ -858,24 +859,21 @@ pub struct GlobalCtxt<'tcx> {
     /// Data layout specification for the current target.
     pub data_layout: TargetDataLayout,
 
-    /// Used to prevent layout from recursing too deeply.
-    pub layout_depth: Cell<usize>,
-
     /// Map from function to the `#[derive]` mode that it's defining. Only used
     /// by `proc-macro` crates.
-    pub derive_macros: RefCell<NodeMap<Symbol>>,
+    pub derive_macros: Lock<NodeMap<Symbol>>,
 
-    stability_interner: RefCell<FxHashSet<&'tcx attr::Stability>>,
+    stability_interner: Lock<FxHashSet<&'tcx attr::Stability>>,
 
-    pub interpret_interner: RefCell<InterpretInterner<'tcx>>,
+    pub interpret_interner: Lock<InterpretInterner<'tcx>>,
 
-    layout_interner: RefCell<FxHashSet<&'tcx LayoutDetails>>,
+    layout_interner: Lock<FxHashSet<&'tcx LayoutDetails>>,
 
     /// A vector of every trait accessible in the whole crate
     /// (i.e. including those from subcrates). This is used only for
     /// error reporting, and so is lazily initialized and generally
-    /// shouldn't taint the common path (hence the RefCell).
-    pub all_traits: RefCell<Option<Vec<DefId>>>,
+    /// shouldn't taint the common path (hence the Lock).
+    pub all_traits: Lock<Option<Vec<DefId>>>,
 
     /// A general purpose channel to throw data out the back towards LLVM worker
     /// threads.
@@ -883,7 +881,7 @@ pub struct GlobalCtxt<'tcx> {
     /// This is intended to only get used during the trans phase of the compiler
     /// when satisfying the query for a particular codegen unit. Internally in
     /// the query it'll send data along this channel to get processed later.
-    pub tx_to_llvm_workers: mpsc::Sender<Box<Any + Send>>,
+    pub tx_to_llvm_workers: Lock<mpsc::Sender<Box<Any + Send>>>,
 
     output_filenames: Arc<OutputFilenames>,
 }
@@ -984,35 +982,34 @@ impl<'tcx> InterpretInterner<'tcx> {
     }
 }
 
-impl<'tcx> GlobalCtxt<'tcx> {
+impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// Get the global TyCtxt.
-    pub fn global_tcx<'a>(&'a self) -> TyCtxt<'a, 'tcx, 'tcx> {
+    #[inline]
+    pub fn global_tcx(self) -> TyCtxt<'a, 'gcx, 'gcx> {
         TyCtxt {
-            gcx: self,
-            interners: &self.global_interners
+            gcx: self.gcx,
+            interners: &self.gcx.global_interners,
         }
     }
-}
 
-impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     pub fn alloc_generics(self, generics: ty::Generics) -> &'gcx ty::Generics {
-        self.global_arenas.generics.alloc(generics)
+        self.global_arenas.current().generics.alloc(generics)
     }
 
     pub fn alloc_steal_mir(self, mir: Mir<'gcx>) -> &'gcx Steal<Mir<'gcx>> {
-        self.global_arenas.steal_mir.alloc(Steal::new(mir))
+        self.global_arenas.current().steal_mir.alloc(Steal::new(mir))
     }
 
     pub fn alloc_mir(self, mir: Mir<'gcx>) -> &'gcx Mir<'gcx> {
-        self.global_arenas.mir.alloc(mir)
+        self.global_arenas.current().mir.alloc(mir)
     }
 
     pub fn alloc_tables(self, tables: ty::TypeckTables<'gcx>) -> &'gcx ty::TypeckTables<'gcx> {
-        self.global_arenas.tables.alloc(tables)
+        self.global_arenas.current().tables.alloc(tables)
     }
 
     pub fn alloc_trait_def(self, def: ty::TraitDef) -> &'gcx ty::TraitDef {
-        self.global_arenas.trait_def.alloc(def)
+        self.global_arenas.current().trait_def.alloc(def)
     }
 
     pub fn alloc_adt_def(self,
@@ -1022,7 +1019,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                          repr: ReprOptions)
                          -> &'gcx ty::AdtDef {
         let def = ty::AdtDef::new(self, did, kind, variants, repr);
-        self.global_arenas.adt_def.alloc(def)
+        self.global_arenas.current().adt_def.alloc(def)
     }
 
     pub fn alloc_byte_array(self, bytes: &[u8]) -> &'gcx [u8] {
@@ -1059,7 +1056,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             return alloc;
         }
 
-        let interned = self.global_arenas.const_allocs.alloc(alloc);
+        let interned = self.global_arenas.current().const_allocs.alloc(alloc);
         if let Some(prev) = self.interpret_interner.borrow_mut().allocs.replace(interned) {
             bug!("Tried to overwrite interned Allocation: {:#?}", prev)
         }
@@ -1087,24 +1084,26 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     }
 
     pub fn intern_stability(self, stab: attr::Stability) -> &'gcx attr::Stability {
-        if let Some(st) = self.stability_interner.borrow().get(&stab) {
+        let mut stability_interner = self.stability_interner.borrow_mut();
+        if let Some(st) = stability_interner.get(&stab) {
             return st;
         }
 
         let interned = self.global_interners.arena.alloc(stab);
-        if let Some(prev) = self.stability_interner.borrow_mut().replace(interned) {
+        if let Some(prev) = stability_interner.replace(interned) {
             bug!("Tried to overwrite interned Stability: {:?}", prev)
         }
         interned
     }
 
     pub fn intern_layout(self, layout: LayoutDetails) -> &'gcx LayoutDetails {
-        if let Some(layout) = self.layout_interner.borrow().get(&layout) {
+        let mut layout_interner = self.layout_interner.borrow_mut();
+        if let Some(layout) = layout_interner.get(&layout) {
             return layout;
         }
 
-        let interned = self.global_arenas.layout.alloc(layout);
-        if let Some(prev) = self.layout_interner.borrow_mut().replace(interned) {
+        let interned = self.global_arenas.current().layout.alloc(layout);
+        if let Some(prev) = layout_interner.replace(interned) {
             bug!("Tried to overwrite interned Layout: {:?}", prev)
         }
         interned
@@ -1131,7 +1130,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// value (types, substs, etc.) can only be used while `ty::tls` has a valid
     /// reference to the context, to allow formatting values that need it.
     pub fn create_and_enter<F, R>(s: &'tcx Session,
-                                  cstore: &'tcx CrateStore,
+                                  cstore: &'tcx (CrateStore + Sync),
                                   local_providers: ty::maps::Providers<'tcx>,
                                   extern_providers: ty::maps::Providers<'tcx>,
                                   arenas: &'tcx AllArenas<'tcx>,
@@ -1141,6 +1140,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                                   crate_name: &str,
                                   tx: mpsc::Sender<Box<Any + Send>>,
                                   output_filenames: &OutputFilenames,
+                                  gcx_ptr: Arc<Mutex<usize>>,
                                   f: F) -> R
                                   where F: for<'b> FnOnce(TyCtxt<'b, 'tcx, 'tcx>) -> R
     {
@@ -1153,7 +1153,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         providers[LOCAL_CRATE] = local_providers;
 
         let def_path_hash_to_def_id = if s.opts.build_dep_graph() {
-            let upstream_def_path_tables: Vec<(CrateNum, Rc<_>)> = cstore
+            let upstream_def_path_tables: Vec<(CrateNum, Lrc<_>)> = cstore
                 .crates_untracked()
                 .iter()
                 .map(|&cnum| (cnum, cstore.def_path_table(cnum)))
@@ -1188,13 +1188,13 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         for (k, v) in resolutions.trait_map {
             let hir_id = hir.node_to_hir_id(k);
             let map = trait_map.entry(hir_id.owner)
-                .or_insert_with(|| Rc::new(FxHashMap()));
-            Rc::get_mut(map).unwrap()
+                .or_insert_with(|| Lrc::new(FxHashMap()));
+            Lrc::get_mut(map).unwrap()
                             .insert(hir_id.local_id,
-                                    Rc::new(StableVec::new(v)));
+                                    Lrc::new(StableVec::new(v)));
         }
 
-        tls::enter_global(GlobalCtxt {
+        let gcx = &GlobalCtxt {
             sess: s,
             cstore,
             global_arenas: &arenas.global,
@@ -1204,10 +1204,10 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             types: common_types,
             trait_map,
             export_map: resolutions.export_map.into_iter().map(|(k, v)| {
-                (k, Rc::new(v))
+                (k, Lrc::new(v))
             }).collect(),
             freevars: resolutions.freevars.into_iter().map(|(k, v)| {
-                (hir.local_def_id(k), Rc::new(v))
+                (hir.local_def_id(k), Lrc::new(v))
             }).collect(),
             maybe_unused_trait_imports:
                 resolutions.maybe_unused_trait_imports
@@ -1222,20 +1222,21 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             hir,
             def_path_hash_to_def_id,
             maps: maps::Maps::new(providers),
-            rcache: RefCell::new(FxHashMap()),
+            rcache: Lock::new(FxHashMap()),
             selection_cache: traits::SelectionCache::new(),
             evaluation_cache: traits::EvaluationCache::new(),
             crate_name: Symbol::intern(crate_name),
             data_layout,
-            layout_interner: RefCell::new(FxHashSet()),
-            layout_depth: Cell::new(0),
-            derive_macros: RefCell::new(NodeMap()),
-            stability_interner: RefCell::new(FxHashSet()),
-            interpret_interner: Default::default(),
-            all_traits: RefCell::new(None),
-            tx_to_llvm_workers: tx,
+            layout_interner: Lock::new(FxHashSet()),
+            derive_macros: Lock::new(NodeMap()),
+            stability_interner: Lock::new(FxHashSet()),
+            interpret_interner: Lock::new(Default::default()),
+            all_traits: Lock::new(None),
+            tx_to_llvm_workers: Lock::new(tx),
             output_filenames: Arc::new(output_filenames.clone()),
-       }, f)
+        };
+
+        tls::enter_global(gcx, gcx_ptr, f)
     }
 
     pub fn consider_optimizing<T: Fn() -> String>(&self, msg: T) -> bool {
@@ -1243,15 +1244,15 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.sess.consider_optimizing(&cname, msg)
     }
 
-    pub fn lang_items(self) -> Rc<middle::lang_items::LanguageItems> {
+    pub fn lang_items(self) -> Lrc<middle::lang_items::LanguageItems> {
         self.get_lang_items(LOCAL_CRATE)
     }
 
-    pub fn stability(self) -> Rc<stability::Index<'tcx>> {
+    pub fn stability(self) -> Lrc<stability::Index<'tcx>> {
         self.stability_index(LOCAL_CRATE)
     }
 
-    pub fn crates(self) -> Rc<Vec<CrateNum>> {
+    pub fn crates(self) -> Lrc<Vec<CrateNum>> {
         self.all_crate_nums(LOCAL_CRATE)
     }
 
@@ -1312,7 +1313,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 
     // Note that this is *untracked* and should only be used within the query
     // system if the result is otherwise tracked through queries
-    pub fn crate_data_as_rc_any(self, cnum: CrateNum) -> Rc<Any> {
+    pub fn crate_data_as_rc_any(self, cnum: CrateNum) -> Lrc<Any> {
         self.cstore.crate_data_as_rc_any(cnum)
     }
 
@@ -1374,11 +1375,27 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
 
 impl<'gcx: 'tcx, 'tcx> GlobalCtxt<'gcx> {
     /// Call the closure with a local `TyCtxt` using the given arena.
-    pub fn enter_local<F, R>(&self, arena: &'tcx DroplessArena, f: F) -> R
+    pub fn enter_local<F, R>(&self,
+                             arena: &'tcx DroplessArena,
+                             f: F) -> R
         where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
     {
         let interners = CtxtInterners::new(arena);
-        tls::enter(self, &interners, f)
+        let tcx = TyCtxt {
+            gcx: self,
+            interners: &interners,
+        };
+        ty::tls::with_related_context(tcx.global_tcx(), |icx| {
+            let new_icx = ty::tls::ImplicitCtxt {
+                tcx,
+                query: icx.query.clone(),
+                task: icx.task,
+                buffer_diagnostics: icx.buffer_diagnostics,
+            };
+            ty::tls::enter_context(&new_icx, |new_icx| {
+                f(new_icx.tcx)
+            })
+        })
     }
 }
 
@@ -1525,21 +1542,25 @@ impl<'a, 'tcx> Lift<'tcx> for &'a Slice<Predicate<'a>> {
 }
 
 pub mod tls {
-    use super::{CtxtInterners, GlobalCtxt, TyCtxt};
+    use super::{GlobalCtxt, TyCtxt};
 
-    use std::cell::Cell;
     use std::fmt;
+    use std::mem;
     use syntax_pos;
+    use ty::maps;
+    use errors::{Diagnostic, TRACK_DIAGNOSTICS};
+    use rayon_core;
+    use dep_graph::OpenTask;
+    use rustc_data_structures::sync::{Lrc, Lock};
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
-    /// Marker types used for the scoped TLS slot.
-    /// The type context cannot be used directly because the scoped TLS
-    /// in libstd doesn't allow types generic over lifetimes.
-    enum ThreadLocalGlobalCtxt {}
-    enum ThreadLocalInterners {}
-
-    thread_local! {
-        static TLS_TCX: Cell<Option<(*const ThreadLocalGlobalCtxt,
-                                     *const ThreadLocalInterners)>> = Cell::new(None)
+    #[derive(Clone)]
+    pub struct ImplicitCtxt<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
+        pub tcx: TyCtxt<'a, 'gcx, 'tcx>,
+        pub query: Lrc<maps::QueryJob<'gcx>>,
+        pub task: &'a Lock<OpenTask>,
+        pub buffer_diagnostics: bool,
     }
 
     fn span_debug(span: syntax_pos::Span, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1548,59 +1569,156 @@ pub mod tls {
         })
     }
 
-    pub fn enter_global<'gcx, F, R>(gcx: GlobalCtxt<'gcx>, f: F) -> R
-        where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'gcx>) -> R
+    fn track_diagnostic(diagnostic: &Diagnostic) {
+        with_context(|context| {
+            if context.query.track_diagnostics {
+                context.query.diagnostics.lock().push(diagnostic.clone());
+            }
+        })
+    }
+
+    struct OnDrop<F: Fn()>(F);
+
+    impl<F: Fn()> Drop for OnDrop<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
+    pub fn with_thread_locals<F, R>(f: F) -> R
+        where F: FnOnce() -> R
     {
         syntax_pos::SPAN_DEBUG.with(|span_dbg| {
             let original_span_debug = span_dbg.get();
             span_dbg.set(span_debug);
-            let result = enter(&gcx, &gcx.global_interners, f);
-            span_dbg.set(original_span_debug);
-            result
+
+            let _on_drop = OnDrop(move || {
+                span_dbg.set(original_span_debug);
+            });
+
+            TRACK_DIAGNOSTICS.with(|current| {
+                let original = current.get();
+                current.set(track_diagnostic);
+
+                let _on_drop = OnDrop(move || {
+                    current.set(original);
+                });
+
+                f()
+            })
         })
     }
 
-    pub fn enter<'a, 'gcx: 'tcx, 'tcx, F, R>(gcx: &'a GlobalCtxt<'gcx>,
-                                             interners: &'a CtxtInterners<'tcx>,
-                                             f: F) -> R
-        where F: FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
+    pub fn enter_global<'gcx, F, R>(gcx: &GlobalCtxt<'gcx>, gcx_ptr: Arc<Mutex<usize>>, f: F) -> R
+        where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'gcx>) -> R
     {
-        let gcx_ptr = gcx as *const _ as *const ThreadLocalGlobalCtxt;
-        let interners_ptr = interners as *const _ as *const ThreadLocalInterners;
-        TLS_TCX.with(|tls| {
-            let prev = tls.get();
-            tls.set(Some((gcx_ptr, interners_ptr)));
-            let ret = f(TyCtxt {
-                gcx,
-                interners,
+        with_thread_locals(|| {
+            let global_query = Lrc::new(maps::QueryJob::new(None, false, 0, None));
+
+            *gcx_ptr.lock().unwrap() = gcx as *const _ as usize;
+
+            let _on_drop = OnDrop(move || {
+                *gcx_ptr.lock().unwrap() = 0;
             });
-            tls.set(prev);
-            ret
+
+            let tcx = TyCtxt {
+                gcx,
+                interners: &gcx.global_interners,
+            };
+            let icx = ImplicitCtxt {
+                tcx,
+                buffer_diagnostics: false,
+                query: global_query,
+                task: &Lock::new(OpenTask::Ignore),
+            };
+            enter_context(&icx, |_| {
+                f(tcx)
+            })
         })
+    }
+
+    pub fn enter_context<'a, 'gcx: 'tcx, 'tcx, F, R>(context: &ImplicitCtxt<'a, 'gcx, 'tcx>,
+                                                     f: F) -> R
+        where F: FnOnce(&ImplicitCtxt<'a, 'gcx, 'tcx>) -> R
+    {
+        rayon_core::fiber::tlv::set(context as *const _ as usize, || {
+            f(&context)
+        })
+    }
+
+    pub unsafe fn with_global_query<F, R>(gcx_ptr: usize, f: F) -> R
+        where F: for<'a, 'gcx, 'tcx> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
+    {
+        let gcx = &*(gcx_ptr as *const GlobalCtxt<'static>);
+        let tcx = TyCtxt {
+            gcx,
+            interners: &gcx.global_interners,
+        };
+        let global_query = Lrc::new(maps::QueryJob::new(None, false, 0, None));
+        let icx = ImplicitCtxt {
+            query: global_query,
+            buffer_diagnostics: false,
+            tcx,
+            task: &Lock::new(OpenTask::Ignore),
+        };
+        enter_context(&icx, |_| f(tcx))
+    }
+
+    pub fn with_context_opt<F, R>(f: F) -> R
+        where F: for<'a, 'gcx, 'tcx> FnOnce(Option<&ImplicitCtxt<'a, 'gcx, 'tcx>>) -> R
+    {
+        let context = rayon_core::fiber::tlv::get();
+        if context == 0 {
+            f(None)
+        } else {
+            unsafe { f(Some(&*(context as *const ImplicitCtxt))) }
+        }
+    }
+
+    pub fn with_fully_related_context<'a, 'gcx, 'tcx, F, R>(tcx: TyCtxt<'a, 'gcx, 'tcx>, f: F) -> R
+        where F: for<'b> FnOnce(&ImplicitCtxt<'b, 'gcx, 'tcx>) -> R
+    {
+        with_context(|context| {
+            unsafe {
+                let gcx = tcx.gcx as *const _ as usize;
+                let interners = tcx.interners as *const _ as usize;
+                assert!(context.tcx.gcx as *const _ as usize == gcx);
+                assert!(context.tcx.interners as *const _ as usize == interners);
+                let context: &ImplicitCtxt = mem::transmute(context);
+                f(context)
+            }
+        })
+    }
+
+    pub fn with_related_context<'a, 'gcx, 'tcx1, F, R>(tcx: TyCtxt<'a, 'gcx, 'tcx1>, f: F) -> R
+        where F: for<'b, 'tcx2> FnOnce(&ImplicitCtxt<'b, 'gcx, 'tcx2>) -> R
+    {
+        with_context(|context| {
+            unsafe {
+                let gcx = tcx.gcx as *const _ as usize;
+                assert!(context.tcx.gcx as *const _ as usize == gcx);
+                let context: &ImplicitCtxt = mem::transmute(context);
+                f(context)
+            }
+        })
+    }
+
+    pub fn with_context<F, R>(f: F) -> R
+        where F: for<'a, 'gcx, 'tcx> FnOnce(&ImplicitCtxt<'a, 'gcx, 'tcx>) -> R
+    {
+        with_context_opt(|opt_context| f(opt_context.expect("no ImplicitCtxt stored in tls")))
     }
 
     pub fn with<F, R>(f: F) -> R
         where F: for<'a, 'gcx, 'tcx> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
     {
-        TLS_TCX.with(|tcx| {
-            let (gcx, interners) = tcx.get().unwrap();
-            let gcx = unsafe { &*(gcx as *const GlobalCtxt) };
-            let interners = unsafe { &*(interners as *const CtxtInterners) };
-            f(TyCtxt {
-                gcx,
-                interners,
-            })
-        })
+        with_context(|context| f(context.tcx))
     }
 
     pub fn with_opt<F, R>(f: F) -> R
         where F: for<'a, 'gcx, 'tcx> FnOnce(Option<TyCtxt<'a, 'gcx, 'tcx>>) -> R
     {
-        if TLS_TCX.with(|tcx| tcx.get().is_some()) {
-            with(|v| f(Some(v)))
-        } else {
-            f(None)
-        }
+        with_context_opt(|opt_context| f(opt_context.map(|context| context.tcx)))
     }
 }
 
@@ -1770,28 +1888,31 @@ macro_rules! intern_method {
                                             $needs_infer:expr) -> $ty:ty) => {
         impl<'a, 'gcx, $lt_tcx> TyCtxt<'a, 'gcx, $lt_tcx> {
             pub fn $method(self, v: $alloc) -> &$lt_tcx $ty {
-                {
-                    let key = ($alloc_to_key)(&v);
-                    if let Some(i) = self.interners.$name.borrow().get(key) {
+                let key = ($alloc_to_key)(&v);
+                let mut interner = self.interners.$name.borrow_mut();
+                if let Some(i) = interner.get(key) {
+                    return i.0;
+                }
+                let global_interner = if !self.is_global() {
+                    let global_interner = self.global_interners.$name.borrow_mut();
+                    if let Some(i) = global_interner.get(key) {
                         return i.0;
                     }
-                    if !self.is_global() {
-                        if let Some(i) = self.global_interners.$name.borrow().get(key) {
-                            return i.0;
-                        }
-                    }
-                }
+                    Some(global_interner)
+                } else {
+                    None
+                };
 
                 // HACK(eddyb) Depend on flags being accurate to
                 // determine that all contents are in the global tcx.
                 // See comments on Lift for why we can't use that.
                 if !($needs_infer)(&v) {
-                    if !self.is_global() {
+                    if let Some(mut global_interners) = global_interner {
                         let v = unsafe {
                             mem::transmute(v)
                         };
                         let i = ($alloc_to_ret)(self.global_interners.arena.$alloc_method(v));
-                        self.global_interners.$name.borrow_mut().insert(Interned(i));
+                        global_interners.insert(Interned(i));
                         return i;
                     }
                 } else {
@@ -1805,7 +1926,7 @@ macro_rules! intern_method {
                 }
 
                 let i = ($alloc_to_ret)(self.interners.arena.$alloc_method(v));
-                self.interners.$name.borrow_mut().insert(Interned(i));
+                interner.insert(Interned(i));
                 i
             }
         }
@@ -2264,7 +2385,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         lint::struct_lint_level(self.sess, lint, level, src, None, msg)
     }
 
-    pub fn in_scope_traits(self, id: HirId) -> Option<Rc<StableVec<TraitCandidate>>> {
+    pub fn in_scope_traits(self, id: HirId) -> Option<Lrc<StableVec<TraitCandidate>>> {
         self.in_scope_traits_map(id.owner)
             .and_then(|map| map.get(&id.local_id).cloned())
     }
@@ -2281,7 +2402,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     }
 
     pub fn object_lifetime_defaults(self, id: HirId)
-        -> Option<Rc<Vec<ObjectLifetimeDefault>>>
+        -> Option<Lrc<Vec<ObjectLifetimeDefault>>>
     {
         self.object_lifetime_defaults_map(id.owner)
             .and_then(|map| map.get(&id.local_id).cloned())
@@ -2352,7 +2473,7 @@ pub fn provide(providers: &mut ty::maps::Providers) {
         // Once red/green incremental compilation lands we should be able to
         // remove this because while the crate changes often the lint level map
         // will change rarely.
-        tcx.dep_graph.with_ignore(|| Rc::new(middle::lang_items::collect(tcx)))
+        tcx.dep_graph.with_ignore(|| Lrc::new(middle::lang_items::collect(tcx)))
     };
     providers.freevars = |tcx, id| tcx.gcx.freevars.get(&id).cloned();
     providers.maybe_unused_trait_import = |tcx, id| {
@@ -2360,12 +2481,12 @@ pub fn provide(providers: &mut ty::maps::Providers) {
     };
     providers.maybe_unused_extern_crates = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        Rc::new(tcx.maybe_unused_extern_crates.clone())
+        Lrc::new(tcx.maybe_unused_extern_crates.clone())
     };
 
     providers.stability_index = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        Rc::new(stability::Index::new(tcx))
+        Lrc::new(stability::Index::new(tcx))
     };
     providers.lookup_stability = |tcx, id| {
         assert_eq!(id.krate, LOCAL_CRATE);
@@ -2383,11 +2504,11 @@ pub fn provide(providers: &mut ty::maps::Providers) {
     };
     providers.all_crate_nums = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        Rc::new(tcx.cstore.crates_untracked())
+        Lrc::new(tcx.cstore.crates_untracked())
     };
     providers.postorder_cnums = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);
-        Rc::new(tcx.cstore.postorder_cnums_untracked())
+        Lrc::new(tcx.cstore.postorder_cnums_untracked())
     };
     providers.output_filenames = |tcx, cnum| {
         assert_eq!(cnum, LOCAL_CRATE);

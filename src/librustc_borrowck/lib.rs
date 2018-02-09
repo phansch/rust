@@ -19,10 +19,13 @@
 #![feature(match_default_bindings)]
 #![feature(quote)]
 
+#![recursion_limit="256"]
+
 #[macro_use] extern crate log;
 extern crate syntax;
 extern crate syntax_pos;
 extern crate rustc_errors as errors;
+extern crate rustc_data_structures;
 
 // for "clarity", rename the graphviz crate to dot; graphviz within `borrowck`
 // refers to the borrowck-specific graphviz adapter traits.

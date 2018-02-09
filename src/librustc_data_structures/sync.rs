@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-//! This mdoule defines types which are thread safe if cfg!(parallel_queries) is true.
+//! This module defines types which are thread safe if cfg!(parallel_queries) is true.
 //!
 //! `Lrc` is an alias of either Rc or Arc.
 //!
@@ -26,11 +26,6 @@
 //!
 //! `MTLock` is a mutex which disappears if cfg!(parallel_queries) is false.
 //!
-//! `rustc_global!` gives us a way to declare variables which are intended to be
-//! global for the current rustc session. This currently maps to thread-locals,
-//! since rustdoc uses the rustc libraries in multiple threads.
-//! These globals should eventually be moved into the `Session` structure.
-//!
 //! `rustc_erase_owner!` erases a OwningRef owner into Erased or Erased + Send + Sync
 //! depending on the value of cfg!(parallel_queries).
 
@@ -39,6 +34,29 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::fmt;
 use owning_ref::{Erased, OwningRef};
+
+pub fn serial_join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
+    where A: FnOnce() -> RA,
+          B: FnOnce() -> RB
+{
+    (oper_a(), oper_b())
+}
+
+pub struct SerialScope;
+
+impl SerialScope {
+    pub fn spawn<F>(&self, f: F)
+        where F: FnOnce(&SerialScope)
+    {
+        f(self)
+    }
+}
+
+pub fn serial_scope<F, R>(f: F) -> R
+    where F: FnOnce(&SerialScope) -> R
+{
+    f(&SerialScope)
+}
 
 cfg_if! {
     if #[cfg(not(parallel_queries))] {
@@ -55,9 +73,19 @@ cfg_if! {
             }
         }
 
+        pub use self::serial_join as join;
+        pub use self::serial_scope as scope;
+
+        pub use std::iter::Iterator as ParallelIterator;
+
+        pub fn par_iter<T: IntoIterator>(t: T) -> T::IntoIter {
+            t.into_iter()
+        }
+
         pub type MetadataRef = OwningRef<Box<Erased>, [u8]>;
 
         pub use std::rc::Rc as Lrc;
+        pub use std::rc::Weak as Weak;
         pub use std::cell::Ref as ReadGuard;
         pub use std::cell::RefMut as WriteGuard;
         pub use std::cell::RefMut as LockGuard;
@@ -162,10 +190,20 @@ cfg_if! {
         use parking_lot;
 
         pub use std::sync::Arc as Lrc;
+        pub use std::sync::Weak as Weak;
 
         pub use self::Lock as MTLock;
 
         use parking_lot::Mutex as InnerLock;
+
+        pub use rayon::{join, scope};
+
+        pub use rayon::iter::ParallelIterator;
+        use rayon::iter::IntoParallelIterator;
+
+        pub fn par_iter<T: IntoParallelIterator>(t: T) -> T::Iter {
+            t.into_par_iter()
+        }
 
         pub type MetadataRef = OwningRef<Box<Erased + Send + Sync>, [u8]>;
 
@@ -177,7 +215,7 @@ cfg_if! {
         macro_rules! rustc_erase_owner {
             ($v:expr) => {{
                 let v = $v;
-                ::rustc_data_structures::sync::assert_send_sync_val(&v);
+                ::rustc_data_structures::sync::assert_send_val(&v);
                 v.erase_send_sync_owner()
             }}
         }
@@ -262,32 +300,8 @@ cfg_if! {
 }
 
 pub fn assert_sync<T: ?Sized + Sync>() {}
+pub fn assert_send_val<T: ?Sized + Send>(_t: &T) {}
 pub fn assert_send_sync_val<T: ?Sized + Sync + Send>(_t: &T) {}
-
-#[macro_export]
-#[allow_internal_unstable]
-macro_rules! rustc_global {
-    // empty (base case for the recursion)
-    () => {};
-
-    // process multiple declarations
-    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr; $($rest:tt)*) => (
-        thread_local!($(#[$attr])* $vis static $name: $t = $init);
-        rustc_global!($($rest)*);
-    );
-
-    // handle a single declaration
-    ($(#[$attr:meta])* $vis:vis static $name:ident: $t:ty = $init:expr) => (
-        thread_local!($(#[$attr])* $vis static $name: $t = $init);
-    );
-}
-
-#[macro_export]
-macro_rules! rustc_access_global {
-    ($name:path, $callback:expr) => {
-        $name.with($callback)
-    }
-}
 
 impl<T: Copy + Debug> Debug for LockCell<T> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {

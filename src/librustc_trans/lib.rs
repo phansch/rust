@@ -35,6 +35,8 @@
 #![feature(conservative_impl_trait)]
 #![feature(optin_builtin_traits)]
 
+#![recursion_limit="256"]
+
 use rustc::dep_graph::WorkProduct;
 use syntax_pos::symbol::Symbol;
 
@@ -42,16 +44,16 @@ use syntax_pos::symbol::Symbol;
 extern crate bitflags;
 extern crate flate2;
 extern crate libc;
+extern crate rayon;
 #[macro_use] extern crate rustc;
 extern crate jobserver;
-extern crate num_cpus;
 extern crate rustc_mir;
 extern crate rustc_allocator;
 extern crate rustc_apfloat;
 extern crate rustc_back;
 extern crate rustc_binaryen;
 extern crate rustc_const_math;
-extern crate rustc_data_structures;
+#[macro_use] extern crate rustc_data_structures;
 extern crate rustc_demangle;
 extern crate rustc_incremental;
 extern crate rustc_llvm as llvm;
@@ -73,8 +75,8 @@ pub use llvm_util::target_features;
 
 use std::any::Any;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::mpsc;
+use rustc_data_structures::sync::{self, Lrc};
 
 use rustc::dep_graph::DepGraph;
 use rustc::hir::def_id::CrateNum;
@@ -203,7 +205,7 @@ impl TransCrate for LlvmTransCrate {
         target_features(sess)
     }
 
-    fn metadata_loader(&self) -> Box<MetadataLoader> {
+    fn metadata_loader(&self) -> Box<MetadataLoader + sync::Sync> {
         box metadata::LlvmMetadataLoader
     }
 
@@ -272,6 +274,7 @@ pub fn __rustc_codegen_backend() -> Box<TransCrate> {
     LlvmTransCrate::new()
 }
 
+#[derive(Debug)]
 struct ModuleTranslation {
     /// The name of the module. When the crate may be saved between
     /// compilations, incremental compilation requires that name be
@@ -348,6 +351,7 @@ struct CompiledModule {
     bytecode_compressed: Option<PathBuf>,
 }
 
+#[derive(Debug)]
 enum ModuleSource {
     /// Copy the `.o` files or whatever from the incr. comp. directory.
     Preexisting(WorkProduct),
@@ -395,11 +399,11 @@ struct CrateInfo {
     profiler_runtime: Option<CrateNum>,
     sanitizer_runtime: Option<CrateNum>,
     is_no_builtins: FxHashSet<CrateNum>,
-    native_libraries: FxHashMap<CrateNum, Rc<Vec<NativeLibrary>>>,
+    native_libraries: FxHashMap<CrateNum, Lrc<Vec<NativeLibrary>>>,
     crate_name: FxHashMap<CrateNum, String>,
-    used_libraries: Rc<Vec<NativeLibrary>>,
-    link_args: Rc<Vec<String>>,
-    used_crate_source: FxHashMap<CrateNum, Rc<CrateSource>>,
+    used_libraries: Lrc<Vec<NativeLibrary>>,
+    link_args: Lrc<Vec<String>>,
+    used_crate_source: FxHashMap<CrateNum, Lrc<CrateSource>>,
     used_crates_static: Vec<(CrateNum, LibSource)>,
     used_crates_dynamic: Vec<(CrateNum, LibSource)>,
 }

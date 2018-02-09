@@ -13,9 +13,9 @@
 //! type, and vice versa.
 
 use hygiene::SyntaxContext;
+use GLOBALS;
 
 use serialize::{Decodable, Decoder, Encodable, Encoder};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -83,10 +83,6 @@ impl Decodable for Ident {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(u32);
 
-// The interner in thread-local, so `Symbol` shouldn't move between threads.
-impl !Send for Symbol { }
-impl !Sync for Symbol { }
-
 impl Symbol {
     /// Maps a string to its interned representation.
     pub fn intern(string: &str) -> Self {
@@ -107,9 +103,9 @@ impl Symbol {
     }
 
     pub fn as_str(self) -> InternedString {
-        with_interner(|interner| unsafe {
+        with_interner(|interner| {
             InternedString {
-                string: ::std::mem::transmute::<&str, &str>(interner.get(self))
+                string: interner.get(self)
             }
         })
     }
@@ -163,7 +159,7 @@ impl<T: ::std::ops::Deref<Target=str>> PartialEq<T> for Symbol {
 #[derive(Default)]
 pub struct Interner {
     names: HashMap<Box<str>, Symbol>,
-    strings: Vec<Box<str>>,
+    strings: Vec<&'static str>,
     gensyms: Vec<Symbol>,
 }
 
@@ -187,7 +183,7 @@ impl Interner {
 
         let name = Symbol(self.strings.len() as u32);
         let string = string.to_string().into_boxed_str();
-        self.strings.push(string.clone());
+        self.strings.push(Box::leak(string.clone()));
         self.names.insert(string, name);
         name
     }
@@ -214,7 +210,7 @@ impl Interner {
         symbol.0 as usize >= self.strings.len()
     }
 
-    pub fn get(&self, symbol: Symbol) -> &str {
+    pub fn get(&self, symbol: Symbol) -> &'static str {
         match self.strings.get(symbol.0 as usize) {
             Some(ref string) => string,
             None => self.get(self.gensyms[(!0 - symbol.0) as usize]),
@@ -247,7 +243,7 @@ macro_rules! declare_keywords {(
     }
 
     impl Interner {
-        fn fresh() -> Self {
+        pub fn fresh() -> Self {
             Interner::prefill(&[$($string,)*])
         }
     }
@@ -330,23 +326,16 @@ declare_keywords! {
     (60, Union,          "union")
 }
 
-// If an interner exists in TLS, return it. Otherwise, prepare a fresh one.
+// If an interner exists, return it. Otherwise, prepare a fresh one.
+#[inline]
 fn with_interner<T, F: FnOnce(&mut Interner) -> T>(f: F) -> T {
-    thread_local!(static INTERNER: RefCell<Interner> = {
-        RefCell::new(Interner::fresh())
-    });
-    INTERNER.with(|interner| f(&mut *interner.borrow_mut()))
+    GLOBALS.with(|globals| f(&mut *globals.symbol_interner.lock()))
 }
 
-/// Represents a string stored in the thread-local interner. Because the
-/// interner lives for the life of the thread, this can be safely treated as an
-/// immortal string, as long as it never crosses between threads.
-///
-/// FIXME(pcwalton): You must be careful about what you do in the destructors
-/// of objects stored in TLS, because they may run after the interner is
-/// destroyed. In particular, they must not access string contents. This can
-/// be fixed in the future by just leaking all strings until thread death
-/// somehow.
+/// Represents a string stored in the interner.
+/// The interner leaks strings so this can refer to &'static str
+/// which enables it to deref to str. Ideally this should do lookup
+/// in the interner instead so we can free the memory.
 #[derive(Clone, Copy, Hash, PartialOrd, Eq, Ord)]
 pub struct InternedString {
     string: &'static str,
@@ -388,8 +377,6 @@ impl<'a> ::std::cmp::PartialEq<InternedString> for &'a String {
     }
 }
 
-impl !Send for InternedString { }
-
 impl ::std::ops::Deref for InternedString {
     type Target = str;
     fn deref(&self) -> &str { self.string }
@@ -422,6 +409,7 @@ impl Encodable for InternedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Globals;
 
     #[test]
     fn interner_tests() {
@@ -444,7 +432,9 @@ mod tests {
 
     #[test]
     fn without_first_quote_test() {
-        let i = Ident::from_str("'break");
-        assert_eq!(i.without_first_quote().name, keywords::Break.name());
+        GLOBALS.set(&Globals::new(), || {
+            let i = Ident::from_str("'break");
+            assert_eq!(i.without_first_quote().name, keywords::Break.name());
+        });
     }
 }

@@ -27,6 +27,8 @@
 #![feature(slice_patterns)]
 #![feature(conservative_impl_trait)]
 
+#![recursion_limit="256"]
+
 extern crate ar;
 extern crate flate2;
 #[macro_use]
@@ -40,7 +42,7 @@ extern crate rustc_incremental;
 #[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
-extern crate rustc_data_structures;
+#[macro_use] extern crate rustc_data_structures;
 
 pub extern crate rustc as __rustc;
 

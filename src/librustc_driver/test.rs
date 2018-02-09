@@ -29,6 +29,8 @@ use rustc::hir::map as hir_map;
 use rustc::session::{self, config};
 use rustc::session::config::{OutputFilenames, OutputTypes};
 use std::rc::Rc;
+use rustc_data_structures::sync::{Send, Lrc};
+use syntax;
 use syntax::ast;
 use syntax::abi::Abi;
 use syntax::codemap::{CodeMap, FilePathMapping, FileName};
@@ -93,8 +95,18 @@ fn errors(msgs: &[&str]) -> (Box<Emitter + Send>, usize) {
 }
 
 fn test_env<F>(source_string: &str,
-               (emitter, expected_err_count): (Box<Emitter + Send>, usize),
+               args: (Box<Emitter + Send>, usize),
                body: F)
+    where F: FnOnce(Env)
+{
+    syntax::with_globals(&syntax::Globals::new(), || {
+        test_env_impl(source_string, args, body)
+    });
+}
+
+fn test_env_impl<F>(source_string: &str,
+                    (emitter, expected_err_count): (Box<Emitter + Send>, usize),
+                    body: F)
     where F: FnOnce(Env)
 {
     let mut options = config::basic_options();
@@ -105,8 +117,9 @@ fn test_env<F>(source_string: &str,
     let sess = session::build_session_(options,
                                        None,
                                        diagnostic_handler,
-                                       Rc::new(CodeMap::new(FilePathMapping::empty())));
-    let cstore = Rc::new(CStore::new(::get_trans(&sess).metadata_loader()));
+                                       Lrc::new(CodeMap::new(FilePathMapping::empty())));
+    driver::spawn_thread_pool(&sess, |gcx_ptr| {
+    let cstore = CStore::new(::get_trans(&sess).metadata_loader());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     let input = config::Input::Str {
         name: FileName::Anon,
@@ -150,6 +163,7 @@ fn test_env<F>(source_string: &str,
                              "test_crate",
                              tx,
                              &outputs,
+                             gcx_ptr,
                              |tcx| {
         tcx.infer_ctxt().enter(|infcx| {
             let mut region_scope_tree = region::ScopeTree::default();
@@ -164,6 +178,7 @@ fn test_env<F>(source_string: &str,
             infcx.resolve_regions_and_report_errors(def_id, &region_scope_tree, &outlives_env);
             assert_eq!(tcx.sess.err_count(), expected_err_count);
         });
+    });
     });
 }
 

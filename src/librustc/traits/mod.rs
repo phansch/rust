@@ -25,7 +25,7 @@ use ty::{self, AdtKind, Ty, TyCtxt, TypeFoldable, ToPredicate};
 use ty::error::{ExpectedFound, TypeError};
 use infer::{InferCtxt};
 
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
 
@@ -224,7 +224,7 @@ pub struct DerivedObligationCause<'tcx> {
     parent_trait_ref: ty::PolyTraitRef<'tcx>,
 
     /// The parent trait had this cause
-    parent_code: Rc<ObligationCauseCode<'tcx>>
+    parent_code: Lrc<ObligationCauseCode<'tcx>>
 }
 
 pub type Obligations<'tcx, O> = Vec<Obligation<'tcx, O>>;
@@ -724,11 +724,11 @@ fn substitute_normalize_and_test_predicates<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
 fn vtable_methods<'a, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     trait_ref: ty::PolyTraitRef<'tcx>)
-    -> Rc<Vec<Option<(DefId, &'tcx Substs<'tcx>)>>>
+    -> Lrc<Vec<Option<(DefId, &'tcx Substs<'tcx>)>>>
 {
     debug!("vtable_methods({:?})", trait_ref);
 
-    Rc::new(
+    Lrc::new(
         supertraits(tcx, trait_ref).flat_map(move |trait_ref| {
             let trait_methods = tcx.associated_items(trait_ref.def_id())
                 .filter(|item| item.kind == ty::AssociatedKind::Method);

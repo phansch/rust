@@ -35,13 +35,12 @@ use self::Level::*;
 
 use emitter::{Emitter, EmitterWriter};
 
+use rustc_data_structures::sync::{Lrc, Lock, LockCell, Send, Sync};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::stable_hasher::StableHasher;
 
+use std::cell::Cell;
 use std::borrow::Cow;
-use std::cell::{RefCell, Cell};
-use std::mem;
-use std::rc::Rc;
 use std::{error, fmt};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
@@ -103,6 +102,8 @@ pub struct SubstitutionPart {
     pub snippet: String,
 }
 
+pub type CodeMapperDyn = CodeMapper + Send + Sync;
+
 pub trait CodeMapper {
     fn lookup_char_pos(&self, pos: BytePos) -> Loc;
     fn span_to_lines(&self, sp: Span) -> FileLinesResult;
@@ -110,13 +111,14 @@ pub trait CodeMapper {
     fn span_to_filename(&self, sp: Span) -> FileName;
     fn merge_spans(&self, sp_lhs: Span, sp_rhs: Span) -> Option<Span>;
     fn call_span_if_macro(&self, sp: Span) -> Span;
-    fn ensure_filemap_source_present(&self, file_map: Rc<FileMap>) -> bool;
+    fn ensure_filemap_source_present(&self, file_map: Lrc<FileMap>) -> bool;
     fn doctest_offset_line(&self, line: usize) -> usize;
 }
 
 impl CodeSuggestion {
     /// Returns the assembled code suggestions and whether they should be shown with an underline.
-    pub fn splice_lines(&self, cm: &CodeMapper) -> Vec<(String, Vec<SubstitutionPart>)> {
+    pub fn splice_lines(&self, cm: &CodeMapperDyn)
+                        -> Vec<(String, Vec<SubstitutionPart>)> {
         use syntax_pos::{CharPos, Loc, Pos};
 
         fn push_trailing(buf: &mut String,
@@ -260,21 +262,25 @@ pub struct Handler {
     pub flags: HandlerFlags,
 
     err_count: AtomicUsize,
-    emitter: RefCell<Box<Emitter>>,
-    continue_after_error: Cell<bool>,
-    delayed_span_bug: RefCell<Option<Diagnostic>>,
-    tracked_diagnostics: RefCell<Option<Vec<Diagnostic>>>,
+    emitter: Lock<Box<Emitter + Send>>,
+    continue_after_error: LockCell<bool>,
+    delayed_span_bug: Lock<Option<Diagnostic>>,
 
     // This set contains the `DiagnosticId` of all emitted diagnostics to avoid
     // emitting the same diagnostic with extended help (`--teach`) twice, which
     // would be uneccessary repetition.
-    tracked_diagnostic_codes: RefCell<FxHashSet<DiagnosticId>>,
+    tracked_diagnostic_codes: Lock<FxHashSet<DiagnosticId>>,
 
     // This set contains a hash of every diagnostic that has been emitted by
     // this handler. These hashes is used to avoid emitting the same error
     // twice.
-    emitted_diagnostics: RefCell<FxHashSet<u128>>,
+    emitted_diagnostics: Lock<FxHashSet<u128>>,
 }
+
+fn default_track_diagnostic(_: &Diagnostic) {}
+
+thread_local!(pub static TRACK_DIAGNOSTICS: Cell<fn(&Diagnostic)> =
+                Cell::new(default_track_diagnostic));
 
 #[derive(Default)]
 pub struct HandlerFlags {
@@ -287,7 +293,7 @@ impl Handler {
     pub fn with_tty_emitter(color_config: ColorConfig,
                             can_emit_warnings: bool,
                             treat_err_as_bug: bool,
-                            cm: Option<Rc<CodeMapper>>)
+                            cm: Option<Lrc<CodeMapperDyn>>)
                             -> Handler {
         Handler::with_tty_emitter_and_flags(
             color_config,
@@ -300,7 +306,7 @@ impl Handler {
     }
 
     pub fn with_tty_emitter_and_flags(color_config: ColorConfig,
-                                      cm: Option<Rc<CodeMapper>>,
+                                      cm: Option<Lrc<CodeMapperDyn>>,
                                       flags: HandlerFlags)
                                       -> Handler {
         let emitter = Box::new(EmitterWriter::stderr(color_config, cm, false, false));
@@ -309,7 +315,7 @@ impl Handler {
 
     pub fn with_emitter(can_emit_warnings: bool,
                         treat_err_as_bug: bool,
-                        e: Box<Emitter>)
+                        e: Box<Emitter + Send>)
                         -> Handler {
         Handler::with_emitter_and_flags(
             e,
@@ -320,16 +326,15 @@ impl Handler {
             })
     }
 
-    pub fn with_emitter_and_flags(e: Box<Emitter>, flags: HandlerFlags) -> Handler {
+    pub fn with_emitter_and_flags(e: Box<Emitter + Send>, flags: HandlerFlags) -> Handler {
         Handler {
             flags,
             err_count: AtomicUsize::new(0),
-            emitter: RefCell::new(e),
-            continue_after_error: Cell::new(true),
-            delayed_span_bug: RefCell::new(None),
-            tracked_diagnostics: RefCell::new(None),
-            tracked_diagnostic_codes: RefCell::new(FxHashSet()),
-            emitted_diagnostics: RefCell::new(FxHashSet()),
+            emitter: Lock::new(e),
+            continue_after_error: LockCell::new(true),
+            delayed_span_bug: Lock::new(None),
+            tracked_diagnostic_codes: Lock::new(FxHashSet()),
+            emitted_diagnostics: Lock::new(FxHashSet()),
         }
     }
 
@@ -343,7 +348,7 @@ impl Handler {
     /// tools that want to reuse a `Parser` cleaning the previously emitted diagnostics as well as
     /// the overall count of emitted error diagnostics.
     pub fn reset_err_count(&self) {
-        self.emitted_diagnostics.replace(FxHashSet());
+        *self.emitted_diagnostics.borrow_mut() = FxHashSet();
         self.err_count.store(0, SeqCst);
     }
 
@@ -551,21 +556,14 @@ impl Handler {
         self.err_count() > 0
     }
     pub fn abort_if_errors(&self) {
-        let s;
-        match self.err_count() {
-            0 => {
-                if let Some(bug) = self.delayed_span_bug.borrow_mut().take() {
-                    DiagnosticBuilder::new_diagnostic(self, bug).emit();
-                }
-                return;
+        if self.err_count() == 0 {
+            if let Some(bug) = self.delayed_span_bug.borrow_mut().take() {
+                DiagnosticBuilder::new_diagnostic(self, bug).emit();
             }
-            1 => s = "aborting due to previous error".to_string(),
-            _ => {
-                s = format!("aborting due to {} previous errors", self.err_count());
-            }
+            return;
         }
 
-        self.fatal(&s).raise();
+        FatalError.raise();
     }
     pub fn emit(&self, msp: &MultiSpan, msg: &str, lvl: Level) {
         if lvl == Warning && !self.flags.can_emit_warnings {
@@ -590,17 +588,6 @@ impl Handler {
         }
     }
 
-    pub fn track_diagnostics<F, R>(&self, f: F) -> (R, Vec<Diagnostic>)
-        where F: FnOnce() -> R
-    {
-        let prev = mem::replace(&mut *self.tracked_diagnostics.borrow_mut(),
-                                Some(Vec::new()));
-        let ret = f();
-        let diagnostics = mem::replace(&mut *self.tracked_diagnostics.borrow_mut(), prev)
-            .unwrap();
-        (ret, diagnostics)
-    }
-
     /// `true` if a diagnostic with this code has already been emitted in this handler.
     ///
     /// Used to suppress emitting the same error multiple times with extended explanation when
@@ -612,9 +599,9 @@ impl Handler {
     fn emit_db(&self, db: &DiagnosticBuilder) {
         let diagnostic = &**db;
 
-        if let Some(ref mut list) = *self.tracked_diagnostics.borrow_mut() {
-            list.push(diagnostic.clone());
-        }
+        TRACK_DIAGNOSTICS.with(|track_diagnostics| {
+            track_diagnostics.get()(diagnostic);
+        });
 
         if let Some(ref code) = diagnostic.code {
             self.tracked_diagnostic_codes.borrow_mut().insert(code.clone());

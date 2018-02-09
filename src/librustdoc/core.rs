@@ -30,7 +30,7 @@ use errors::emitter::ColorConfig;
 
 use std::cell::{RefCell, Cell};
 use std::mem;
-use std::rc::Rc;
+use rustc_data_structures::sync::Lrc;
 use std::path::PathBuf;
 
 use visit_ast::RustdocVisitor;
@@ -141,7 +141,7 @@ pub fn run_core(search_paths: SearchPaths,
         ..config::basic_options().clone()
     };
 
-    let codemap = Rc::new(codemap::CodeMap::new(sessopts.file_path_mapping()));
+    let codemap = Lrc::new(codemap::CodeMap::new(sessopts.file_path_mapping()));
     let diagnostic_handler = errors::Handler::with_tty_emitter(ColorConfig::Auto,
                                                                true,
                                                                false,
@@ -151,13 +151,14 @@ pub fn run_core(search_paths: SearchPaths,
         sessopts, cpath, diagnostic_handler, codemap,
     );
     let trans = rustc_driver::get_trans(&sess);
-    let cstore = Rc::new(CStore::new(trans.metadata_loader()));
+    let cstore = CStore::new(trans.metadata_loader());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
 
     let mut cfg = config::build_configuration(&sess, config::parse_cfgspecs(cfgs));
     target_features::add_configuration(&mut cfg, &sess, &*trans);
     sess.parse_sess.config = cfg;
 
+    driver::spawn_thread_pool(&sess, |gcx_ptr| {
     let control = &driver::CompileController::basic();
 
     let krate = panictry!(driver::phase_1_parse_input(control, &sess, &input));
@@ -195,13 +196,13 @@ pub fn run_core(search_paths: SearchPaths,
         maybe_unused_extern_crates: resolver.maybe_unused_extern_crates.clone(),
     };
     let analysis = ty::CrateAnalysis {
-        access_levels: Rc::new(AccessLevels::default()),
+        access_levels: Lrc::new(AccessLevels::default()),
         name: name.to_string(),
         glob_map: if resolver.make_glob_map { Some(resolver.glob_map.clone()) } else { None },
     };
 
     let arenas = AllArenas::new();
-    let hir_map = hir_map::map_crate(&sess, &*cstore, &mut hir_forest, &defs);
+    let hir_map = hir_map::map_crate(&sess, &cstore, &mut hir_forest, &defs);
     let output_filenames = driver::build_output_filenames(&input,
                                                           &None,
                                                           &None,
@@ -213,13 +214,14 @@ pub fn run_core(search_paths: SearchPaths,
     abort_on_err(driver::phase_3_run_analysis_passes(&*trans,
                                                      control,
                                                      &sess,
-                                                     &*cstore,
+                                                     &cstore,
                                                      hir_map,
                                                      analysis,
                                                      resolutions,
                                                      &arenas,
                                                      &name,
                                                      &output_filenames,
+                                                     gcx_ptr,
                                                      |tcx, analysis, _, result| {
         if let Err(_) = result {
             sess.fatal("Compilation failed, aborting rustdoc");
@@ -250,11 +252,12 @@ pub fn run_core(search_paths: SearchPaths,
         debug!("crate: {:?}", tcx.hir.krate());
 
         let krate = {
-            let mut v = RustdocVisitor::new(&*cstore, &ctxt);
+            let mut v = RustdocVisitor::new(&cstore, &ctxt);
             v.visit(tcx.hir.krate());
             v.clean(&ctxt)
         };
 
         (krate, ctxt.renderinfo.into_inner())
     }), &sess)
+    })
 }
