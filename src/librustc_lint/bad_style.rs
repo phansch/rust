@@ -16,7 +16,7 @@ use lint::{LintPass, LateLintPass};
 use syntax::abi::Abi;
 use syntax::ast;
 use syntax::attr;
-use syntax_pos::Span;
+use syntax_pos::{BytePos, Span};
 
 use rustc::hir::{self, PatKind};
 use rustc::hir::intravisit::FnKind;
@@ -342,6 +342,16 @@ impl NonUpperCaseGlobals {
     fn check_upper_case(cx: &LateContext, sort: &str, name: ast::Name, span: Span) {
         if name.as_str().chars().any(|c| c.is_lowercase()) {
             let uc = NonSnakeCase::to_snake_case(&name.as_str()).to_uppercase();
+
+            let start = cx.tcx.sess.codemap().span_to_snippet(span)
+                .map(|snippet| snippet.find(name.as_str().chars().as_str()).unwrap_or(0))
+                .unwrap_or(0) as u32;
+            let end = start + name.as_str().len() as u32;
+            let span = Span::new(span.lo() + BytePos(start as u32), span.lo() + BytePos(end as u32), span.ctxt());
+
+            // TODO: Add more tests for all the different kinds
+            // Add tests for different lengths, too
+            // Then refactor the above more.
             if name != &*uc {
                 cx.span_lint(NON_UPPER_CASE_GLOBALS,
                              span,
