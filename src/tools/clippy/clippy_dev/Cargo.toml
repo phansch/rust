@@ -15,3 +15,5 @@ walkdir = "2"
 
 [features]
 deny-warnings = []
+
+[workspace]

@@ -550,16 +550,45 @@ impl Step for Clippy {
             .stage_out(compiler, Mode::ToolRustc)
             .join(&self.host.triple)
             .join(builder.cargo_dir());
-        cargo.env("HOST_LIBS", host_libs);
-        cargo.env("TARGET_LIBS", target_libs);
+        cargo.env("HOST_LIBS", &host_libs);
+        cargo.env("TARGET_LIBS", &target_libs);
         // clippy tests need to find the driver
-        cargo.env("CLIPPY_DRIVER_PATH", clippy);
+        cargo.env("CLIPPY_DRIVER_PATH", &clippy);
 
         cargo.arg("--").args(builder.config.cmd.test_args());
 
         cargo.add_rustc_lib_path(builder, compiler);
 
-        builder.run(&mut cargo.into());
+        if builder.config.cmd.bless() {
+            // We always need to run the second command here
+            builder.info("running Clippy tests and bless");
+            try_run(builder, &mut cargo.into());
+
+            // Bless the test output if `--bless` was provided
+            //
+            // Clippy's tests have their own bless mechanism via `cargo dev bless` because Clippy's
+            // compiletest doesn't have test blessing support.
+            // If Clippy ever starts using the same `compiletest` version as rustc,
+            // we could utilize the bless mechanism of that.
+            let mut cargo_bless = tool::prepare_tool_cargo(
+                builder,
+                compiler,
+                Mode::ToolRustc,
+                host,
+                "run",
+                "src/tools/clippy/clippy_dev",
+                SourceType::InTree,
+                &[],
+            );
+            cargo_bless.arg("--package").arg("clippy_dev");
+            cargo_bless.arg("--bin").arg("clippy_dev");
+            cargo_bless.arg("--").arg("bless");
+            builder.info("running cargo dev bless");
+            builder.run(&mut cargo_bless.into());
+        } else {
+            builder.info("running Clippy tests");
+            builder.run(&mut cargo.into());
+        }
     }
 }
 

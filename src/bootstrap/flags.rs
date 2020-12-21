@@ -308,6 +308,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`",
             }
             "clippy" => {
                 opts.optflag("", "fix", "automatically apply lint suggestions");
+                opts.optflag("", "bless", "update all stderr/stdout files of failing ui tests");
             }
             "doc" => {
                 opts.optflag("", "open", "open the docs in a browser");
