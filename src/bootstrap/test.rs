@@ -562,7 +562,8 @@ impl Step for Clippy {
         if builder.config.cmd.bless() {
             // We always need to run the second command here
             builder.info("running Clippy tests and bless");
-            try_run(builder, &mut cargo.into());
+            // try_run(builder, &mut cargo.into());
+            builder.try_run(&mut cargo.into());
 
             // Bless the test output if `--bless` was provided
             //
